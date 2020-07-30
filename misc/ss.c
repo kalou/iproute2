@@ -99,6 +99,7 @@ int preferred_family = AF_UNSPEC;
 static int show_options;
 int show_details;
 static int show_users;
+static int show_desc;
 static int show_mem;
 static int show_tcpinfo;
 static int show_bpf;
@@ -505,6 +506,7 @@ struct user_ent {
 	char		*process;
 	char		*process_ctx;
 	char		*socket_ctx;
+	char		*sock_desc;
 };
 
 #define USER_ENT_HASH_SIZE	256
@@ -520,7 +522,8 @@ static int user_ent_hashfn(unsigned int ino)
 static void user_ent_add(unsigned int ino, char *process,
 					int pid, int fd,
 					char *proc_ctx,
-					char *sock_ctx)
+					char *sock_ctx,
+					char *sock_desc)
 {
 	struct user_ent *p, **pp;
 
@@ -536,6 +539,7 @@ static void user_ent_add(unsigned int ino, char *process,
 	p->process = strdup(process);
 	p->process_ctx = strdup(proc_ctx);
 	p->socket_ctx = strdup(sock_ctx);
+	p->sock_desc = strdup(sock_desc);
 
 	pp = &user_ent_hash[user_ent_hashfn(ino)];
 	p->next = *pp;
@@ -570,6 +574,7 @@ static void user_ent_hash_build(void)
 	DIR *dir;
 	char *pid_context;
 	char *sock_context;
+	char *sock_desc;
 	const char *no_ctx = "unavailable";
 	static int user_ent_hash_build_init;
 
@@ -621,6 +626,7 @@ static void user_ent_hash_build(void)
 			int fd;
 			ssize_t link_len;
 			char tmp[1024];
+			FILE *fp;
 
 			if (sscanf(d1->d_name, "%d%c", &fd, &crap) != 1)
 				continue;
@@ -643,9 +649,20 @@ static void user_ent_hash_build(void)
 			if (getfilecon(tmp, &sock_context) <= 0)
 				sock_context = strdup(no_ctx);
 
-			if (*p == '\0') {
-				FILE *fp;
+			snprintf(tmp, sizeof(tmp), "%s/%d/fdinfo/%s",
+					root, pid, d1->d_name);
 
+			sock_desc = strdup("");
+			if ((fp = fopen(tmp, "r")) != NULL) {
+				char *head;
+				while(fscanf(fp, "%m[^:]: %m[^\n]\n",
+				             &head, &sock_desc) != EOF) {
+					if (!strcmp(head, "desc"))
+						break;
+				}
+			}
+
+			if (*p == '\0') {
 				snprintf(tmp, sizeof(tmp), "%s/%d/stat",
 					root, pid);
 				if ((fp = fopen(tmp, "r")) != NULL) {
@@ -655,8 +672,10 @@ static void user_ent_hash_build(void)
 				}
 			}
 			user_ent_add(ino, p, pid, fd,
-					pid_context, sock_context);
+					pid_context, sock_context,
+					sock_desc);
 			free(sock_context);
+			free(sock_desc);
 		}
 		free(pid_context);
 		closedir(dir1);
@@ -667,7 +686,8 @@ static void user_ent_hash_build(void)
 enum entry_types {
 	USERS,
 	PROC_CTX,
-	PROC_SOCK_CTX
+	PROC_SOCK_CTX,
+	DESC
 };
 
 #define ENTRY_BUF_SIZE 512
@@ -710,6 +730,14 @@ static int find_entry(unsigned int ino, char **buf, int type)
 					p->process, p->pid,
 					p->process_ctx, p->fd,
 					p->socket_ctx);
+				break;
+			case DESC:
+				/* TODO: there's an off-by-one eating the last
+				 * char, same above.
+				 */
+				len = snprintf(ptr, buf_len - buf_used, 
+						"%s,", p->sock_desc);
+				printf("Was %d\n", len);
 				break;
 			default:
 				fprintf(stderr, "ss: invalid type: %d\n", type);
@@ -2346,6 +2374,13 @@ static void proc_ctx_print(struct sockstat *s)
 	} else if (show_users) {
 		if (find_entry(s->ino, &buf, USERS) > 0) {
 			out(" users:(%s)", buf);
+			free(buf);
+		}
+	}
+
+	if (show_desc) {
+		if (find_entry(s->ino, &buf, DESC) > 0) {
+			out(" desc:(%s)", buf);
 			free(buf);
 		}
 	}
@@ -5093,6 +5128,7 @@ static void _usage(FILE *dest)
 "   -e, --extended      show detailed socket information\n"
 "   -m, --memory        show socket memory usage\n"
 "   -p, --processes     show process using socket\n"
+"   -c, --desc          show socket descriptions\n"
 "   -i, --info          show internal TCP information\n"
 "       --tipcinfo      show internal tipc socket information\n"
 "   -s, --summary       show socket usage summary\n"
@@ -5218,6 +5254,7 @@ static const struct option long_opts[] = {
 	{ "memory", 0, 0, 'm' },
 	{ "info", 0, 0, 'i' },
 	{ "processes", 0, 0, 'p' },
+	{ "descs", 0, 0, 'c' },
 	{ "bpf", 0, 0, 'b' },
 	{ "events", 0, 0, 'E' },
 	{ "dccp", 0, 0, 'd' },
@@ -5266,7 +5303,7 @@ int main(int argc, char *argv[])
 	int state_filter = 0;
 
 	while ((ch = getopt_long(argc, argv,
-				 "dhaletuwxnro460spbEf:miA:D:F:vVzZN:KHSO",
+				 "dhaletuwxnro460spcbEf:miA:D:F:vVzZN:KHSO",
 				 long_opts, NULL)) != EOF) {
 		switch (ch) {
 		case 'n':
@@ -5290,6 +5327,10 @@ int main(int argc, char *argv[])
 			break;
 		case 'p':
 			show_users++;
+			user_ent_hash_build();
+			break;
+		case 'c':
+			show_desc++;
 			user_ent_hash_build();
 			break;
 		case 'b':
@@ -5567,7 +5608,7 @@ int main(int argc, char *argv[])
 	if (current_filter.dbs & (1<<XDP_DB))
 		xdp_show(&current_filter);
 
-	if (show_users || show_proc_ctx || show_sock_ctx)
+	if (show_desc || show_users || show_proc_ctx || show_sock_ctx)
 		user_ent_destroy();
 
 	render();
